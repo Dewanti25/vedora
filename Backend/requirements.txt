@@ -8,4 +8,4 @@ pydantic
 passlib[bcrypt]
 bcrypt
 python-multipart
-
+certifi
