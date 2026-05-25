@@ -1,44 +1,89 @@
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import bcrypt
-import hashlib
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, EmailStr
+from typing import Optional
 from jose import JWTError, jwt
 from pymongo import MongoClient
-from dotenv import load_dotenv
+import bcrypt
+import hashlib
+import logging
 import os
-from typing import Optional
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from dotenv import load_dotenv
 
-security = HTTPBearer()
 load_dotenv()
 
-MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+# --------------------------------------------------
+# Environment variables
+# --------------------------------------------------
+
+MONGODB_URI = os.getenv("MONGODB_URI")
+MONGODB_DB = os.getenv("MONGODB_DB", "Vedora")
 JWT_SECRET = os.getenv("JWT_SECRET", "change-me")
-ALGORITHM = "HS256"
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
-DB_NAME = os.getenv("MONGODB_DB", "Vedora")
+ALGORITHM = "HS256"
 
+if not MONGODB_URI:
+    raise RuntimeError("MONGODB_URI is not set")
 
-client = MongoClient(MONGODB_URI)
-# Use DB name from env (default 'Vedora') to avoid casing conflicts
-db = client.get_database(DB_NAME)
+# --------------------------------------------------
+# Logging
+# --------------------------------------------------
 
-app = FastAPI(title="Vedora AI - Backend")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("vedora.main")
+
+# --------------------------------------------------
+# MongoDB connection
+# --------------------------------------------------
+# Temporary Render/Atlas TLS workaround:
+# tlsAllowInvalidCertificates=True is not ideal for final production,
+# but it helps confirm/fix the current TLS handshake issue.
+
+client = MongoClient(
+    MONGODB_URI,
+    tls=True,
+    tlsAllowInvalidCertificates=True,
+    serverSelectionTimeoutMS=30000,
+    connectTimeoutMS=30000,
+)
+
+db = client[MONGODB_DB]
+
+# --------------------------------------------------
+# FastAPI app
+# --------------------------------------------------
+
+app = FastAPI(title="Vedora AI Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL, "http://127.0.0.1:5173"],
+    allow_origins=[
+        FRONTEND_URL,
+        "https://vedora-six.vercel.app",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+security = HTTPBearer(auto_error=False)
+
+# --------------------------------------------------
+# Schemas
+# --------------------------------------------------
 
 class UserCreate(BaseModel):
-    email: str
+    email: EmailStr
     password: str
     role: Optional[str] = "student"
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
 
 
 class Token(BaseModel):
@@ -46,29 +91,48 @@ class Token(BaseModel):
     token_type: str = "bearer"
 
 
+# --------------------------------------------------
+# Password helpers
+# --------------------------------------------------
+
 def _pre_hash_if_needed(password: str) -> bytes:
-    b = password.encode("utf-8")
-    if len(b) > 72:
-        return hashlib.sha256(b).hexdigest().encode("utf-8")
-    return b
+    password_bytes = password.encode("utf-8")
+
+    if len(password_bytes) > 72:
+        return hashlib.sha256(password_bytes).hexdigest().encode("utf-8")
+
+    return password_bytes
 
 
 def hash_password(password: str) -> str:
     key = _pre_hash_if_needed(password)
     hashed = bcrypt.hashpw(key, bcrypt.gensalt())
-    return hashed.decode('utf-8')
+    return hashed.decode("utf-8")
 
 
-def verify_password(plain: str, hashed: str) -> bool:
-    key = _pre_hash_if_needed(plain)
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    key = _pre_hash_if_needed(plain_password)
+
     try:
-        return bcrypt.checkpw(key, hashed.encode('utf-8'))
-    except ValueError:
+        return bcrypt.checkpw(key, hashed_password.encode("utf-8"))
+    except Exception:
         return False
 
 
+# --------------------------------------------------
+# JWT helpers
+# --------------------------------------------------
+
 def create_access_token(data: dict) -> str:
     return jwt.encode(data, JWT_SECRET, algorithm=ALGORITHM)
+
+
+def serialize_user(user: dict) -> dict:
+    return {
+        "id": str(user.get("_id")),
+        "email": user.get("email"),
+        "role": user.get("role", "student"),
+    }
 
 
 def get_user_by_email(email: str):
@@ -77,94 +141,274 @@ def get_user_by_email(email: str):
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     if not credentials or not credentials.credentials:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+        )
+
     token = credentials.credentials
+
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
-        email: str = payload.get("sub")
-        if email is None:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        email = payload.get("sub")
+
+        if not email:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token",
+            )
+
     except JWTError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+        )
+
     user = get_user_by_email(email)
+
     if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
-    user["id"] = str(user.get("_id"))
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found",
+        )
+
     return user
 
 
-@app.post("/register", response_model=dict)
-def register(u: UserCreate):
-    if get_user_by_email(u.email):
-        raise HTTPException(status_code=400, detail="User already exists")
-    user = {"email": u.email, "password": hash_password(u.password), "role": u.role}
-    db.users.insert_one(user)
-    return {"msg": "registered", "email": user["email"]}
+# --------------------------------------------------
+# Basic routes
+# --------------------------------------------------
 
-
-@app.post("/login", response_model=Token)
-def login(u: UserCreate):
-    user = get_user_by_email(u.email)
-    if not user or not verify_password(u.password, user["password"]):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = create_access_token({"sub": user["email"]})
-    return {"access_token": token, "token_type": "bearer"}
+@app.get("/")
+def root():
+    return {
+        "message": "Vedora AI Backend is running",
+        "health": "/health",
+        "db_test": "/db-test",
+        "docs": "/docs",
+    }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "message": "Vedora AI backend is healthy",
+    }
+
+
+@app.get("/db-test")
+def db_test():
+    try:
+        client.admin.command("ping")
+        return {
+            "database": "connected",
+            "db_name": MONGODB_DB,
+        }
+    except Exception as error:
+        logger.exception("MongoDB ping failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"MongoDB connection failed: {str(error)}",
+        )
+
+
+# --------------------------------------------------
+# Auth routes
+# --------------------------------------------------
+
+@app.post("/register")
+def register(user_data: UserCreate):
+    try:
+        existing_user = get_user_by_email(user_data.email)
+
+        if existing_user:
+            raise HTTPException(
+                status_code=400,
+                detail="User already exists",
+            )
+
+        user = {
+            "email": user_data.email,
+            "password": hash_password(user_data.password),
+            "role": user_data.role or "student",
+        }
+
+        result = db.users.insert_one(user)
+
+        return {
+            "msg": "registered",
+            "user": {
+                "id": str(result.inserted_id),
+                "email": user["email"],
+                "role": user["role"],
+            },
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as error:
+        logger.exception("Failed to register user")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error: {str(error)}",
+        )
+
+
+@app.post("/login", response_model=Token)
+def login(login_data: LoginRequest):
+    try:
+        user = get_user_by_email(login_data.email)
+
+        if not user:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid credentials",
+            )
+
+        stored_password = user.get("password", "")
+
+        if not verify_password(login_data.password, stored_password):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid credentials",
+            )
+
+        token = create_access_token(
+            {
+                "sub": user["email"],
+                "role": user.get("role", "student"),
+            }
+        )
+
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as error:
+        logger.exception("Login failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error: {str(error)}",
+        )
 
 
 @app.get("/me")
-def me(user=Depends(get_current_user)):
-    return {"email": user["email"], "role": user.get("role", "student")}
+def me(current_user=Depends(get_current_user)):
+    return {
+        "user": serialize_user(current_user),
+    }
 
+
+# --------------------------------------------------
+# File upload
+# --------------------------------------------------
 
 @app.post("/upload")
-def upload_file(file: UploadFile = File(...), user=Depends(get_current_user)):
+def upload_file(
+    file: UploadFile = File(...),
+    current_user=Depends(get_current_user),
+):
     uploads_dir = os.path.join(os.path.dirname(__file__), "uploads")
     os.makedirs(uploads_dir, exist_ok=True)
-    filepath = os.path.join(uploads_dir, file.filename)
-    with open(filepath, "wb") as f:
-        f.write(file.file.read())
-    db.files.insert_one({"filename": file.filename, "owner": user["email"]})
-    return {"filename": file.filename}
 
+    filepath = os.path.join(uploads_dir, file.filename)
+
+    with open(filepath, "wb") as saved_file:
+        saved_file.write(file.file.read())
+
+    db.files.insert_one(
+        {
+            "filename": file.filename,
+            "owner": current_user["email"],
+        }
+    )
+
+    return {
+        "filename": file.filename,
+        "message": "File uploaded successfully",
+    }
+
+
+# --------------------------------------------------
+# Courses
+# --------------------------------------------------
 
 @app.get("/courses")
 def list_courses():
-    items = list(db.courses.find({}, {"_id": 0}))
-    return {"courses": items}
+    courses = list(db.courses.find({}, {"_id": 0}))
+    return {"courses": courses}
 
+
+@app.post("/courses")
+def create_course(payload: dict, current_user=Depends(get_current_user)):
+    if current_user.get("role") != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Admin only",
+        )
+
+    db.courses.insert_one(payload)
+
+    return {
+        "msg": "created",
+    }
+
+
+# --------------------------------------------------
+# Dashboard stats
+# --------------------------------------------------
 
 @app.get("/stats")
 def stats(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
-    # Basic aggregated stats to drive the dashboard widgets
     courses_count = db.courses.count_documents({})
-    files_count = db.files.count_documents({}) if 'files' in db.list_collection_names() else 0
 
-    # Try to surface user-specific progress if a valid token is provided; fall back to defaults
+    files_count = 0
+    if "files" in db.list_collection_names():
+        files_count = db.files.count_documents({})
+
     user_doc = None
+
     if credentials and credentials.credentials:
         try:
-            payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[ALGORITHM])
+            payload = jwt.decode(
+                credentials.credentials,
+                JWT_SECRET,
+                algorithms=[ALGORITHM],
+            )
             email = payload.get("sub")
+
             if email:
                 user_doc = get_user_by_email(email)
+
         except JWTError:
             user_doc = None
+
     overall_progress = user_doc.get("progress", 75) if user_doc else 75
     study_time_hours = user_doc.get("study_time_hours", 24.6) if user_doc else 24.6
     concepts_learned = user_doc.get("concepts_learned", 128) if user_doc else 128
 
-    # Sample subject progress
     subject_progress = [
-        {"name": "Mathematics", "percent": user_doc.get("math", 85) if user_doc else 85},
-        {"name": "Physics", "percent": user_doc.get("physics", 70) if user_doc else 70},
+        {
+            "name": "Mathematics",
+            "percent": user_doc.get("math", 85) if user_doc else 85,
+        },
+        {
+            "name": "Physics",
+            "percent": user_doc.get("physics", 70) if user_doc else 70,
+        },
     ]
 
-    performance = {"easy": 85, "medium": 72, "hard": 58}
+    performance = {
+        "easy": 85,
+        "medium": 72,
+        "hard": 58,
+    }
 
     return {
         "courses_count": courses_count,
@@ -177,15 +421,16 @@ def stats(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security
     }
 
 
-@app.post("/courses")
-def create_course(payload: dict, user=Depends(get_current_user)):
-    if user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin only")
-    db.courses.insert_one(payload)
-    return {"msg": "created"}
-
+# --------------------------------------------------
+# Local development only
+# --------------------------------------------------
 
 if __name__ == "__main__":
     import uvicorn
-    # Run with reload watching only the Backend folder to avoid reload loops
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True, reload_dirs=["Backend"]) 
+
+    uvicorn.run(
+        "main:app",
+        host="127.0.0.1",
+        port=8000,
+        reload=True,
+    )
