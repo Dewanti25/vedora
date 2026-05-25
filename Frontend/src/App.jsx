@@ -1,4 +1,4 @@
-import React from 'react'
+import React, { useEffect } from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import Login from './pages/Login'
 import Register from './pages/Register'
@@ -25,10 +25,23 @@ import SyllabusPlanner from './pages/SyllabusPlanner'
 
 function PrivateRoute({ children }) {
   const token = localStorage.getItem('token')
-  return token ? children : <Navigate to="/login" />
+  const isDemo = typeof window !== 'undefined' && (import.meta.env.VITE_DEMO_MODE === 'true' || new URLSearchParams(window.location.search).has('demo'))
+  return (token || isDemo) ? children : <Navigate to="/login" />
 }
 
 export default function App() {
+  useEffect(() => {
+    // Auto-set demo token/user when demo mode is active (dev/demo only)
+    try {
+      const isDemo = import.meta.env.VITE_DEMO_MODE === 'true' || (typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('demo'))
+      if (isDemo && !localStorage.getItem('token')) {
+        localStorage.setItem('token', 'demo-token')
+        localStorage.setItem('user', JSON.stringify({ email: 'demo@vedora.ai', role: 'student' }))
+      }
+    } catch (e) {
+      // ignore errors in environments without window
+    }
+  }, [])
   return (
     <BrowserRouter>
       <Routes>
