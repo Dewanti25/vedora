@@ -5,6 +5,7 @@ from ..services.password_service import hash_password, verify_password
 from ..security import create_access_token
 from ..deps import get_current_user
 from typing import Optional
+from datetime import timedelta
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -54,3 +55,14 @@ async def login(payload: LoginIn):
 @router.get('/me')
 async def me(user=Depends(get_current_user)):
     return {'id': user.get('id'), 'email': user.get('email'), 'name': user.get('name'), 'role': user.get('role')}
+
+
+
+@router.post('/demo-token')
+async def demo_token():
+    """Return a short-lived demo token for guest/demo access.
+
+    This token should only grant a guest role and must be short-lived.
+    """
+    token = create_access_token('guest@vedora.local', expires_delta=timedelta(hours=1))
+    return {'token': token, 'user': {'id': 'guest', 'email': 'guest@vedora.local', 'name': 'Demo User', 'role': 'guest'}}
