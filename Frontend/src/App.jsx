@@ -24,23 +24,13 @@ import Textbooks from './pages/Textbooks'
 import SyllabusPlanner from './pages/SyllabusPlanner'
 
 function PrivateRoute({ children }) {
-  const token = localStorage.getItem('token')
-  const isDemo = typeof window !== 'undefined' && (import.meta.env.VITE_DEMO_MODE === 'true' || new URLSearchParams(window.location.search).has('demo'))
-  return (token || isDemo) ? children : <Navigate to="/login" />
+  // Direct access: always allow children (no login required)
+  return children
 }
 
 export default function App() {
   useEffect(() => {
-    // Auto-set demo token/user when demo mode is active (dev/demo only)
-    try {
-      const isDemo = import.meta.env.VITE_DEMO_MODE === 'true' || (typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('demo'))
-      if (isDemo && !localStorage.getItem('token')) {
-        localStorage.setItem('token', 'demo-token')
-        localStorage.setItem('user', JSON.stringify({ email: 'demo@vedora.ai', role: 'student' }))
-      }
-    } catch (e) {
-      // ignore errors in environments without window
-    }
+    // no-op in direct-access mode
   }, [])
   return (
     <BrowserRouter>
