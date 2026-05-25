@@ -20,6 +20,8 @@ JWT_SECRET = os.getenv("JWT_SECRET", "change-me")
 ALGORITHM = "HS256"
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 DB_NAME = os.getenv("MONGODB_DB", "Vedora")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("vedora.main")
 
 
 try:
@@ -33,12 +35,16 @@ try:
     )
     # Use DB name from env (default 'Vedora') to avoid casing conflicts
     db = client.get_database(DB_NAME)
-    # verify connection
-    client.admin.command('ping')
-    logger.info("Connected to MongoDB (ping successful)")
+    # verify connection and fail fast if DB is unreachable
+    try:
+        client.admin.command('ping')
+        logger.info("Connected to MongoDB (ping successful)")
+    except Exception:
+        logger.exception("MongoClient created but ping failed")
+        raise
 except Exception:
     logger.exception("Failed to connect to MongoDB at startup")
-    # keep going; operations will raise on DB use and be logged
+    # keep going with a simple client; DB ops will log failures
     client = MongoClient(MONGODB_URI)
     db = client.get_database(DB_NAME)
 
