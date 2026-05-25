@@ -49,3 +49,27 @@ async def teacher_required(user=Depends(get_current_user)):
     if user.get("role") != "teacher":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Teacher access required")
     return user
+
+
+async def get_optional_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Return a user when a valid token is provided, otherwise return None.
+
+    Use this dependency for routes that should allow both authenticated and
+    unauthenticated (guest) access.
+    """
+    if not credentials or not credentials.credentials:
+        return None
+    token = credentials.credentials
+    try:
+        payload = verify_token(token)
+    except Exception:
+        return None
+
+    email = payload.get("sub") or payload.get("email")
+    if not email:
+        return None
+    try:
+        user = await get_user_by_email(email)
+    except Exception:
+        user = None
+    return user
