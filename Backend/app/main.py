@@ -1,108 +1,228 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-
-from .config import FRONTEND_URL
-from .database import connect_to_mongo, close_mongo_connection
+from pydantic import BaseModel
+import bcrypt
+import hashlib
+from jose import JWTError, jwt
+from pymongo import MongoClient
+import certifi
 import logging
+from dotenv import load_dotenv
+import os
+from typing import Optional
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("vedora")
+security = HTTPBearer()
+load_dotenv()
 
-from .routes import health
+MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+JWT_SECRET = os.getenv("JWT_SECRET", "change-me")
+ALGORITHM = "HS256"
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+DB_NAME = os.getenv("MONGODB_DB", "Vedora")
 
-def create_app() -> FastAPI:
-    app = FastAPI(title="Vedora AI - Backend (new app)")
 
-    # CORS - allow frontend
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[FRONTEND_URL, "http://127.0.0.1:5173"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+try:
+    # Use certifi CA bundle to avoid TLS handshake issues on some hosts
+    client = MongoClient(
+        MONGODB_URI,
+        tls=True,
+        tlsCAFile=certifi.where(),
+        serverSelectionTimeoutMS=30000,
+        connectTimeoutMS=20000,
     )
+    # Use DB name from env (default 'Vedora') to avoid casing conflicts
+    db = client.get_database(DB_NAME)
+    # verify connection
+    client.admin.command('ping')
+    logger.info("Connected to MongoDB (ping successful)")
+except Exception:
+    logger.exception("Failed to connect to MongoDB at startup")
+    # keep going; operations will raise on DB use and be logged
+    client = MongoClient(MONGODB_URI)
+    db = client.get_database(DB_NAME)
 
-    app.include_router(health.router)
-    # user routes
-    from .routes import users
-    app.include_router(users.router)
-    # api routes
-    from .routes import api
-    app.include_router(api.router)
-    # auth
-    from .routes import auth_routes
-    app.include_router(auth_routes.router)
-    # batches
-    from .routes import batch_routes
-    app.include_router(batch_routes.router)
-    # textbooks
-    from .routes import textbook_routes
-    app.include_router(textbook_routes.router)
-    # sessions
-    from .routes import session_routes
-    app.include_router(session_routes.router)
-    # ai
-    from .routes import ai_routes
-    app.include_router(ai_routes.router)
-    # resources listing
-    from .routes import resources_routes
-    app.include_router(resources_routes.router)
-    # schools
-    from .routes import school_routes
-    app.include_router(school_routes.router)
-    # catalog (boards, grades, subjects, courses, chapters)
-    from .routes import catalog_routes
-    app.include_router(catalog_routes.router)
-    # schedules
-    from .routes import schedule_routes
-    app.include_router(schedule_routes.router)
-    # syllabus planner
-    from .routes import syllabus_routes
-    app.include_router(syllabus_routes.router)
-    # register alternate routes (root-level batch syllabus path)
+app = FastAPI(title="Vedora AI - Backend")
+
+logger = logging.getLogger("vedora.main")
+logging.basicConfig(level=logging.INFO)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[FRONTEND_URL, "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class UserCreate(BaseModel):
+    email: str
+    password: str
+    role: Optional[str] = "student"
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+def _pre_hash_if_needed(password: str) -> bytes:
+    b = password.encode("utf-8")
+    if len(b) > 72:
+        return hashlib.sha256(b).hexdigest().encode("utf-8")
+    return b
+
+
+def hash_password(password: str) -> str:
+    key = _pre_hash_if_needed(password)
+    hashed = bcrypt.hashpw(key, bcrypt.gensalt())
+    return hashed.decode('utf-8')
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    key = _pre_hash_if_needed(plain)
     try:
-        app.include_router(syllabus_routes.router_alt)
+        return bcrypt.checkpw(key, hashed.encode('utf-8'))
+    except ValueError:
+        return False
+
+
+def create_access_token(data: dict) -> str:
+    return jwt.encode(data, JWT_SECRET, algorithm=ALGORITHM)
+
+
+def get_user_by_email(email: str):
+    try:
+        return db.users.find_one({"email": email})
     except Exception:
-        pass
-    # homework
-    from .routes import homework_routes
-    app.include_router(homework_routes.router)
-    # notes
-    from .routes import notes_routes
-    app.include_router(notes_routes.router)
-    # quizzes
-    from .routes import quiz_routes
-    app.include_router(quiz_routes.router)
-    # ai service endpoints
-    from .routes import ai_routes
-    app.include_router(ai_routes.router)
+        logger.exception("Error querying user by email")
+        return None
 
-    @app.on_event("startup")
-    async def startup_event():
-        # connect to mongodb
-        connect_to_mongo()
-        logger.info("Connected to MongoDB")
-        # ensure important indexes
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if not credentials or not credentials.credentials:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    except JWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    user = get_user_by_email(email)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    user["id"] = str(user.get("_id"))
+    return user
+
+
+@app.post("/register", response_model=dict)
+def register(u: UserCreate):
+    try:
+        if get_user_by_email(u.email):
+            raise HTTPException(status_code=400, detail="User already exists")
+        user = {"email": u.email, "password": hash_password(u.password), "role": u.role}
+        db.users.insert_one(user)
+        return {"msg": "registered", "email": user["email"]}
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to register user")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.post("/login", response_model=Token)
+def login(u: UserCreate):
+    try:
+        user = get_user_by_email(u.email)
+        if not user or not verify_password(u.password, user.get("password", "")):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        token = create_access_token({"sub": user["email"]})
+        return {"access_token": token, "token_type": "bearer"}
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Login failed")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/me")
+def me(user=Depends(get_current_user)):
+    return {"email": user["email"], "role": user.get("role", "student")}
+
+
+@app.post("/upload")
+def upload_file(file: UploadFile = File(...), user=Depends(get_current_user)):
+    uploads_dir = os.path.join(os.path.dirname(__file__), "uploads")
+    os.makedirs(uploads_dir, exist_ok=True)
+    filepath = os.path.join(uploads_dir, file.filename)
+    with open(filepath, "wb") as f:
+        f.write(file.file.read())
+    db.files.insert_one({"filename": file.filename, "owner": user["email"]})
+    return {"filename": file.filename}
+
+
+@app.get("/courses")
+def list_courses():
+    items = list(db.courses.find({}, {"_id": 0}))
+    return {"courses": items}
+
+
+@app.get("/stats")
+def stats(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
+    # Basic aggregated stats to drive the dashboard widgets
+    courses_count = db.courses.count_documents({})
+    files_count = db.files.count_documents({}) if 'files' in db.list_collection_names() else 0
+
+    # Try to surface user-specific progress if a valid token is provided; fall back to defaults
+    user_doc = None
+    if credentials and credentials.credentials:
         try:
-            from .database import db
-            # unique enrollment per user+batch
-            await db.enrollments.create_index([('user_id', 1), ('batch_id', 1)], unique=True)
-            # unique email for users
-            await db.users.create_index([('email', 1)], unique=True)
-            logger.info("Ensured enrollment unique index")
-        except Exception:
-            logger.exception("Failed to ensure indexes")
+            payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[ALGORITHM])
+            email = payload.get("sub")
+            if email:
+                user_doc = get_user_by_email(email)
+        except JWTError:
+            user_doc = None
+    overall_progress = user_doc.get("progress", 75) if user_doc else 75
+    study_time_hours = user_doc.get("study_time_hours", 24.6) if user_doc else 24.6
+    concepts_learned = user_doc.get("concepts_learned", 128) if user_doc else 128
 
-    @app.on_event("shutdown")
-    async def shutdown_event():
-        close_mongo_connection()
+    # Sample subject progress
+    subject_progress = [
+        {"name": "Mathematics", "percent": user_doc.get("math", 85) if user_doc else 85},
+        {"name": "Physics", "percent": user_doc.get("physics", 70) if user_doc else 70},
+    ]
 
-    return app
+    performance = {"easy": 85, "medium": 72, "hard": 58}
+
+    return {
+        "courses_count": courses_count,
+        "files_count": files_count,
+        "overall_progress": overall_progress,
+        "study_time_hours": study_time_hours,
+        "concepts_learned": concepts_learned,
+        "subject_progress": subject_progress,
+        "performance": performance,
+    }
 
 
-app = create_app()
+@app.post("/courses")
+def create_course(payload: dict, user=Depends(get_current_user)):
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    db.courses.insert_one(payload)
+    return {"msg": "created"}
 
 
 if __name__ == "__main__":
-    uvicorn.run("app.main:app", host="127.0.0.1", port=8000, reload=True)
+    import uvicorn
+    # Run with reload watching only the Backend folder to avoid reload loops
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True, reload_dirs=["Backend"]) 
